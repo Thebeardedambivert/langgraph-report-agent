@@ -236,3 +236,40 @@ parent_builder.add_node("research_team", research_subgraph)
 * **Execution:** The child executes its private loop in isolation.
 * **Output:** When the child hits `END`, LangGraph extracts matching keys (e.g., `research_summary`) and updates `ParentState`.
 * **Isolation Guarantee:** All child scratchpad channels (`search_queries`, `raw_results`, `sub_iterations`) are discarded from parent scope.
+
+---
+
+## 7. Real-Time Streaming Telemetry (`streaming_telemetry.py`)
+
+### The Architectural Problem: The Frozen UI Spinner
+Using `graph.invoke()` forces users to wait for entire multi-node workflows to finish before seeing any output. Using basic `graph.stream()` only yields coarse node-level chunks, failing to provide token-by-token typewriter streams.
+
+### The Solution: `astream_events` v2
+LangGraph's async event bus broadcasts every micro-event across the graph:
+
+```python
+async for event in app.astream_events(initial_input, version="v2"):
+    event_type = event.get("event")
+    node_name = event.get("metadata", {}).get("langgraph_node")
+
+    # 1. Lifecycle: Node Transitions
+    if event_type == "on_chain_start" and node_name:
+        print(f"[⚡ NODE STARTED]: {node_name}")
+
+    # 2. Real-Time Token Stream with Selective Filtering
+    elif event_type == "on_chat_model_stream":
+        # CRITICAL FILTER: Only stream tokens from primary user-facing nodes (draft/revise)
+        # Background judges (eval_accuracy, etc.) remain silent to prevent UI corruption
+        if node_name in ("draft", "revise"):
+            chunk = event["data"]["chunk"]
+            if chunk and chunk.content:
+                print(chunk.content, end="", flush=True)
+
+    # 3. Lifecycle: Node Completion
+    elif event_type == "on_chain_end" and node_name:
+        print(f"[✔ NODE COMPLETED]: {node_name}")
+```
+
+### Telemetry Filter Invariants:
+1. **`event["metadata"]["langgraph_node"]`:** Identifies which specific graph node emitted the event.
+2. **Selective Filtering:** Prevents parallel background nodes (e.g. concurrent judges) from corrupting the UI stream with simultaneous interleaved tokens.
