@@ -101,7 +101,7 @@ def aggregate_evaluations_node(state: ReportState) -> dict:
     policy_result = score_evaluation(validated.model_dump())
 
     critique_entry = (
-        f"[Iter {state['iterations']}] "
+        f"[Iter {state.get('iterations', 0)}] "
         f"Acc: {raw['accuracy']['reason']} | "
         f"Clarity: {raw['clarity']['reason']} | "
         f"Comp: {raw['completeness']['reason']}"
