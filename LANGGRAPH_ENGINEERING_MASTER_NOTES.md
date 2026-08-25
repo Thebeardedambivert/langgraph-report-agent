@@ -209,5 +209,30 @@ To time-travel to a past execution point without modifying history:
 | :--- | :--- | :--- | :--- |
 | **Ambiguous Score Review** | Score `0.65` (0.50–0.75) | Graph halts at `approval_node` via `interrupt()` | Persisted to SQLite, resumed with `Command(resume=...)` |
 | **Iteration Limit Ceiling** | 4 failed revision loops | Deterministic cutoff routes to `failed_node` | `status: 'failed'`, `needs_human_notification: True` |
-| **Time Travel Fork (Invalid Draft)** | Fork Step 03 with hallucinated topic | Evaluator judges score `0.00` across all 4 iteration loops | Successfully contained and failed without corrupting main branch |
-| **Time Travel Fork (Valid Draft)** | Fork Step 03 with accurate 3-bed summary | Evaluator judges score `0.94` on first pass | Directly routed to `END` (`iterations: 0`) down new branch |
+## 6. Subgraph Encapsulation & Parent-Child Channel Isolation (`research_subgraph.py`)
+
+### The Architectural Problem: State Pollution & Variable Collisions
+In monolithic multi-step graphs, letting inner subroutines (like deep search or web scraping) share the parent graph's state schema causes:
+1. **State Pollution:** Parent schemas get cluttered with temporary scrap variables (`raw_html`, `search_queries`).
+2. **Channel Collisions:** Internal retry loops (e.g. `iterations: int`) overwrite parent iteration budgets, causing silent early termination.
+3. **Checkpoint Bloat:** Hundreds of micro-step snapshots clutter the main thread's checkpoint DAG.
+
+### The Solution: Subgraph Encapsulation
+A Subgraph is a compiled `StateGraph(ChildState)` added directly as a node in a parent `StateGraph(ParentState)`:
+
+```python
+# 1. Child graph has its own private schema
+child_builder = StateGraph(ResearchState)
+...
+research_subgraph = child_builder.compile()
+
+# 2. Parent graph registers the compiled child as a single node
+parent_builder = StateGraph(ParentReportState)
+parent_builder.add_node("research_team", research_subgraph)
+```
+
+### Channel Mapping Contract:
+* **Input:** LangGraph automatically extracts matching keys from `ParentState` (e.g., `query`) and injects them into `ChildState`.
+* **Execution:** The child executes its private loop in isolation.
+* **Output:** When the child hits `END`, LangGraph extracts matching keys (e.g., `research_summary`) and updates `ParentState`.
+* **Isolation Guarantee:** All child scratchpad channels (`search_queries`, `raw_results`, `sub_iterations`) are discarded from parent scope.
