@@ -307,3 +307,31 @@ builder.add_edge("tools", "agent")
 2. **Autonomous Re-planning:** Because the error is packaged as a standard message in the context window, the model reads the failure diagnosis on the next turn and can autonomously pivot to fallback tools.
 3. **Loop Bounding:** Never rely on LangGraph's default `GraphRecursionError` as a loop exit strategy. Explicitly enforce iteration budgets or fallback escalation handlers to protect API token budgets.
 
+---
+
+## 9. Production Scaling & Asynchronous Agent Serving Architecture (`schemas.py`, `server.py`, Module A3)
+
+### The Architectural Problem: High-Throughput Burst Ingestion vs. Long-Running Graph Latency
+In production, generating a multi-judge report takes ~45 seconds of LLM execution. When 3,000 users trigger requests during peak morning hours:
+1. **Synchronous Failure Mode:** Holding HTTP connections open causes thread/socket exhaustion in FastAPI/Uvicorn, dropping health checks and crashing the web layer.
+2. **Double-Spend Failure Mode:** Retried client requests without idempotency gates trigger duplicate 45-second agent runs, multiplying LLM token costs.
+
+### The Scaled Architecture: Decoupled Queue-Worker Pattern
+```
+[Client] --(POST /reports)--> [FastAPI Ingestion] --(Push Job)--> [Durable Task Queue (Redis)]
+   |                              | (< 15ms)                            |
+   |                        Returns 202 Accepted                        v
+   |                        (job_id, poll_url)                 [20 Worker Pool (LangGraph)]
+   |                                                                    |
+   +---(GET /reports/{job_id} Polling / SSE Stream)<--------------------+ (Committed Checkpoints)
+```
+
+### Core Invariants of Scaled Agent Ingestion:
+1. **HTTP 202 Accepted Ingestion:** The web layer performs validation, generates a `job_id`, pushes to the task queue, and returns in < 15ms. It never executes LLM logic.
+2. **Idempotency Gates (`idempotency_key`):** Atomic cache checks prevent duplicate job creation when clients retry dropped network requests.
+3. **Stateless Workers & Persistent Checkpointers:** Workers are disposable compute nodes. Graph state is committed to a shared database checkpointer (`PostgresSaver` / `SqliteSaver`) keyed by `thread_id=job_id`.
+4. **Data Contracts (`schemas.py`):**
+   * `ReportRequest`: Ingestion DTO with `transcript` and optional `idempotency_key`.
+   * `JobReceipt`: Immediate HTTP 202 response containing `job_id`, `status="QUEUED"`, and `poll_url`.
+   * `JobStatusResponse`: Polling DTO containing lifecycle state (`QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `NEEDS_APPROVAL`), scores, and draft.
+
