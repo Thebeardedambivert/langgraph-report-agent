@@ -273,3 +273,37 @@ async for event in app.astream_events(initial_input, version="v2"):
 ### Telemetry Filter Invariants:
 1. **`event["metadata"]["langgraph_node"]`:** Identifies which specific graph node emitted the event.
 2. **Selective Filtering:** Prevents parallel background nodes (e.g. concurrent judges) from corrupting the UI stream with simultaneous interleaved tokens.
+
+---
+
+## 8. Dynamic Tool Calling & Autonomous Error Recovery (`tool_agent.py`)
+
+### The Architectural Problem: The Brittle Tool Crash
+In naive linear agents, if an external tool throws an exception (e.g. API 503, database timeout, network disconnect), the unhandled error bubbles up and crashes the entire application process, destroying state and dropping the user session.
+
+### The Solution: ReAct Feedback Loop with `ToolNode(handle_tool_errors=True)`
+LangGraph provides prebuilt primitives for tool calling, execution, routing, and error isolation:
+
+```python
+# 1. State with message reducer
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+# 2. Bind tool schemas to model
+model_with_tools = llm.bind_tools(tools)
+
+# 3. Assemble the self-healing ReAct graph
+builder = StateGraph(AgentState)
+builder.add_node("agent", agent_node)
+builder.add_node("tools", ToolNode(tools, handle_tool_errors=True))
+
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", tools_condition)
+builder.add_edge("tools", "agent")
+```
+
+### Key Tool Calling Invariants:
+1. **`handle_tool_errors=True`:** Intercepts Python exceptions thrown inside any `@tool` function, converts them into a `ToolMessage(content="Error: ...", status="error")`, and appends them to message state instead of crashing.
+2. **Autonomous Re-planning:** Because the error is packaged as a standard message in the context window, the model reads the failure diagnosis on the next turn and can autonomously pivot to fallback tools.
+3. **Loop Bounding:** Never rely on LangGraph's default `GraphRecursionError` as a loop exit strategy. Explicitly enforce iteration budgets or fallback escalation handlers to protect API token budgets.
+

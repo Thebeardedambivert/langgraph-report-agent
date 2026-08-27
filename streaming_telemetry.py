@@ -30,7 +30,7 @@ async def stream_report_agent(transcript_text: str):
         # 1. Track Node Transitions (Lifecycle Events)
         if event_type == "on_chain_start" and node_name and node_name != current_node:
             current_node = node_name
-            print(f"\n\n[⚡ NODE ENTERED]: >>> {node_name.upper()} <<<")
+            print(f"\n\n[NODE ENTERED]: >>> {node_name.upper()} <<<")
             if node_name == "draft":
                 print("--- LIVE DRAFT OUTPUT ---")
 
@@ -45,7 +45,7 @@ async def stream_report_agent(transcript_text: str):
 
         # 3. Track Node Completion
         elif event_type == "on_chain_end" and node_name and node_name == current_node:
-            print(f"\n[✔ NODE COMPLETED]: {node_name}")
+            print(f"\n[NODE COMPLETED]: {node_name}")
             current_node = None
 
     print("\n" + "=" * 65)
