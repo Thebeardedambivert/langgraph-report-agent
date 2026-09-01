@@ -335,3 +335,139 @@ In production, generating a multi-judge report takes ~45 seconds of LLM executio
    * `JobReceipt`: Immediate HTTP 202 response containing `job_id`, `status="QUEUED"`, and `poll_url`.
    * `JobStatusResponse`: Polling DTO containing lifecycle state (`QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `NEEDS_APPROVAL`), scores, and draft.
 
+---
+
+## 10. System Design Under Constraints: Scaling LangGraph to 10,000 Runs / Day (Module A3)
+
+### The Production Scenario:
+Scaling from a local prototype to 10,000 multi-judge agent evaluations per day with a strict 99.9% availability target, zero dropped jobs, and no database lock contention.
+
+---
+
+### A. Reliability Contracts: SLI, SLO, and SLA Definitions
+
+```text
+SLI (Indicator)  --> The real-time metric measured by OpenTelemetry (The Thermometer)
+SLO (Objective)  --> The internal engineering alert threshold (The Warning Alarm)
+SLA (Agreement)  --> The customer contract with financial refund penalties (The Lawsuit)
+```
+
+* **Availability SLO:** 99.9% of API requests return valid status codes over a 30-day window.
+* **Turnaround Time SLO:** 95.0% of report jobs transition from `QUEUED` to `COMPLETED` in < 90 seconds.
+* **Golden Rule:** Internal SLO (99.9%) must ALWAYS be stricter than external customer SLA (99.0%) to prevent paying refunds before internal engineering alarms trigger.
+
+---
+
+### B. Back-of-the-Envelope Scaling Calculations
+
+* **Daily Volume:** 10,000 reports / day
+* **Workday Ingestion QPS (10 hours = 36,000s):** `10,000 / 36,000 = 0.28 requests / second`
+* **Peak Surge QPS (5x peak):** `0.28 * 5 = 1.4 requests / second` (Web ingestion is lightweight; execution is the bottleneck).
+* **Execution Duration:** 35 seconds per multi-judge agent run.
+* **Required Concurrent Workers (Little's Law):**
+  ```text
+  Active Workers = Arrival Rate (QPS) * Job Duration (seconds)
+  Active Workers = 1.4 requests/sec * 35 seconds = 49 to 100 concurrent workers
+  ```
+* **Storage Growth:** 5 checkpoints * 15 KB = 75 KB per report = `750 MB / day (~22.5 GB / month)`.
+
+---
+
+### C. The 4 Scaled Infrastructure Layers
+
+```text
+1. INGESTION LAYER (FastAPI Replicas + Redis Idempotency Gate)
+   - TLS termination and Pydantic validation in < 5ms.
+   - Redis Idempotency Gate: SET idempotency:<hash> <job_id> NX EX 86400
+   - Returns HTTP 202 Accepted {job_id, poll_url} immediately.
+
+2. PERSISTENT BROKER (Redis Streams + Consumer Groups)
+   - Replaces in-memory lists to provide at-least-once delivery.
+   - XADD: Appends tasks to stream.
+   - XREADGROUP: Workers atomically lease tasks into the Pending Entries List (PEL).
+   - XAUTOCLAIM: Recovers abandoned tasks from crashed workers after a 60-second visibility timeout.
+   - Dead-Letter Queue (DLQ): Isolates "Poison Pill" corrupted inputs after 3 retries to prevent cluster crash loops.
+
+3. DISTRIBUTED WORKER POOL (Shared-Nothing Architecture)
+   - Independent Docker containers running LangGraph workflows.
+   - Horizontal Pod Autoscaling (HPA) scales workers from 10 to 100 based on Redis queue depth.
+   - Redis Token Bucket Rate Limiter prevents exceeding LLM provider 429 rate limits.
+
+4. DISTRIBUTED STATE STORE (PostgreSQL + PgBouncer)
+   - Replaces SQLite to eliminate single-writer file lock contention ("database is locked").
+   - Multi-Version Concurrency Control (MVCC) supports hundreds of concurrent writers.
+   - PgBouncer in Transaction Pooling Mode: Pools 500 worker connections down to 20 database server sockets, eliminating 5GB of idle connection RAM overhead.
+```
+
+---
+
+### D. Architectural Decision Summary
+
+| Component | Prototype Choice | Production Scaled Choice | Core Reason / Trade-Off |
+| :--- | :--- | :--- | :--- |
+| **Ingestion** | Synchronous HTTP 200 | Asynchronous HTTP 202 | Prevents gateway timeouts and worker thread starvation |
+| **Deduplication** | None | Redis `SET NX EX` | Prevents retry storms and LLM token double-spend |
+| **Broker** | In-Memory `asyncio.Queue` | Redis Streams | At-least-once durability, worker crash leasing, and DLQ |
+| **State Store** | SQLite (`checkpoints.db`) | PostgreSQL + PgBouncer | MVCC multi-writer support + connection pooling |
+| **Broker Choice** | Apache Kafka | Redis Streams | Kafka is over-engineering for 1.4 peak QPS; Redis handles 10k/day in 10MB RAM |
+
+---
+
+### E. The 4 Strict Component Boundaries
+
+1. **Ingestion Boundary (FastAPI Layer):**
+   - **Owns:** TLS termination, Pydantic validation, Redis idempotency check (`SET NX EX`), `job_id` generation, and returning HTTP 202 in < 5ms.
+   - **Forbidden:** Never imports or executes LangGraph, never makes outbound LLM calls.
+   - **Protocol:** HTTPS REST / JSON.
+
+2. **Message Broker Boundary (Redis Streams):**
+   - **Owns:** Task durability, atomic consumer group leasing (`XREADGROUP`), PEL tracking, and DLQ quarantine.
+   - **Forbidden:** Does not store permanent reports or historical checkpoint DAGs.
+   - **Protocol:** Redis RESP.
+
+3. **Compute Worker Boundary (Docker Pool):**
+   - **Owns:** Leases tasks, executes LangGraph nodes, enforces token-bucket rate limits, and commits state checkpoints. Stateless & disposable.
+   - **Forbidden:** Does not serve HTTP traffic directly to clients.
+   - **Protocol:** Async Python event loop (`asyncio.to_thread`).
+
+4. **Persistence Boundary (PostgreSQL + PgBouncer):**
+   - **Owns:** Durability of LangGraph checkpoint DAGs, execution telemetry, and final Markdown/PDF reports.
+   - **Protocol:** PostgreSQL wire protocol pooled through PgBouncer.
+
+---
+
+### F. Critical Runtime Failure Scenarios & Self-Healing
+
+1. **Mid-Execution Worker Crash (OOM / Host Reboot):**
+   - **Mechanism:** Worker dies before sending `XACK`. Job remains in Redis Pending Entries List (PEL).
+   - **Recovery:** After a 60s visibility timeout, a healthy worker claims the task via `XAUTOCLAIM`, reads the latest checkpoint from PostgreSQL (`thread_id=job_id`), and resumes directly from the failed node without re-running earlier nodes.
+
+2. **Human-in-the-Loop (HITL) Indefinite Pauses:**
+   - **Mechanism:** Low score triggers `interrupt()`. Worker commits state as `NEEDS_APPROVAL`, sends `XACK` to release the queue lease, and immediately picks up the next job.
+   - **Recovery:** When a manager approves via `POST /reports/{id}/resume`, FastAPI enqueues a lightweight `ResumeJob` task. A free worker loads the checkpoint and finishes the graph.
+
+3. **LLM 429 Rate-Limit Spikes:**
+   - **Mechanism:** Exponential backoff with full jitter (`sleep = (2 ^ attempt) + jitter`) prevents stampedes.
+   - **Circuit Breaker:** If 5 consecutive workers hit 429s within 10 seconds, the breaker OPENS, pausing queue consumption for 15s to allow token buckets to replenish.
+
+---
+
+### G. Comprehensive Technology Trade-Off Matrix
+
+1. **Message Broker: Redis Streams vs. Kafka vs. RabbitMQ**
+   - *Redis Streams (Selected):* Sub-millisecond leasing, consumer groups, and PEL tracking in < 10MB RAM with zero cluster overhead for 10k runs/day.
+   - *Kafka (Rejected):* Massive operational complexity (multi-node KRaft cluster, partition rebalance delays) is unjustified for 1.4 peak QPS.
+   - *RabbitMQ (Viable Alternative):* Solid AMQP routing, but Redis was already in our stack for idempotency locks and rate limiters, avoiding extra tool sprawl.
+
+2. **Database: PostgreSQL + PgBouncer vs. DynamoDB vs. SQLite**
+   - *PostgreSQL + PgBouncer (Selected):* ACID compliance, JSONB for LangGraph checkpoint graphs, relational joins for client accounts/billing, and transaction pooling for 100+ workers sharing 20 server sockets.
+   - *SQLite (Rejected):* Single-writer file lock crashes with `database is locked` under concurrent workers.
+   - *DynamoDB (Rejected):* Lacks relational joins for multi-tenant billing tiers and complex analytical audit queries.
+
+3. **Client Updates: Short Polling vs. SSE vs. WebSockets**
+   - *Short Polling (Selected for Web/Mobile):* Stateless, works behind all enterprise firewalls and CDNs with negligible server load (< 7 QPS for 10-20 active jobs).
+   - *Server-Sent Events (Selected for Admin Dashboards):* Unidirectional streaming over standard HTTP for real-time token telemetry without WebSocket handshake complexity.
+   - *WebSockets (Rejected):* Full-duplex is over-engineered since clients only read status updates.
+
+
+
